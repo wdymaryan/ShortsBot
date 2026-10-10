@@ -111,7 +111,7 @@ def get_pixabay_video(fallbacks, output_file, retries=3):
 
     raise Exception("Critical: Failed to download video after trying all fallback queries.")
 
-# --- 5. Pure FFmpeg Video Assembly ---
+# --- 5. Pure FFmpeg Video Assembly (Standardized 30FPS & YUV420P) ---
 def render_scene(video_in, audio_in, srt_in, scene_num):
     out_scene = f"scene_{scene_num}.mp4"
     
@@ -121,15 +121,20 @@ def render_scene(video_in, audio_in, srt_in, scene_num):
     ]).decode().strip()
     duration = float(probe)
 
-    # Subtitle overlay styling
     sub_style = "FontName=DejaVu Sans,FontSize=20,Bold=1,PrimaryColour=&H00FFFF,OutlineColour=&H000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=120"
     vf_string = f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,subtitles={srt_in}:force_style='{sub_style}'"
 
+    # Enforce standard 30fps, yuv420p color space, and 44.1kHz audio across all clips
     cmd = [
         "ffmpeg", "-y", "-i", video_in, "-i", audio_in,
         "-t", str(duration),
         "-vf", vf_string,
-        "-c:v", "libx264", "-c:a", "aac", "-shortest", out_scene
+        "-r", "30",
+        "-pix_fmt", "yuv420p",
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-ar", "44100",
+        "-shortest", out_scene
     ]
     subprocess.run(cmd, check=True)
     return out_scene
@@ -150,17 +155,26 @@ def build_final_video(scene_files, output_final):
     if has_bgm:
         valid_tracks = [os.path.join(bgm_dir, f) for f in os.listdir(bgm_dir) if f.endswith(".mp3")]
         random_bgm = random.choice(valid_tracks)
-        print(f"Applying background track: {random_bgm}")
+        print(f"Applying BGM: {random_bgm}")
         cmd = [
             "ffmpeg", "-y", "-i", "raw_concat.mp4", "-stream_loop", "-1", "-i", random_bgm,
             "-filter_complex", "[1:a]volume=0.10[bgm];[0:a][bgm]amix=inputs=2:duration=first[a]",
-            "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-shortest", output_final
+            "-map", "0:v", "-map", "[a]",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "44100",
+            "-movflags", "+faststart",
+            "-shortest", output_final
         ]
     else:
-        print("No BGM track found. Exporting voiceover only.")
-        cmd = ["ffmpeg", "-y", "-i", "raw_concat.mp4", "-c", "copy", output_final]
+        print("No BGM found. Normalizing final video container...")
+        cmd = [
+            "ffmpeg", "-y", "-i", "raw_concat.mp4",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "44100",
+            "-movflags", "+faststart",
+            output_final
+        ]
         
     subprocess.run(cmd, check=True)
+    
 
 # --- 6. YouTube Upload ---
 def upload_to_youtube(video_path, metadata):
