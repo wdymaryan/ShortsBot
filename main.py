@@ -4,11 +4,25 @@ import requests
 import subprocess
 import random
 import time
+import glob
+import logging
+import fnmatch
+
 import google.generativeai as genai
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
+
+# --- 0. Configure Real-Time Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("shorts.log", mode="a", encoding="utf-8")
+    ]
+)
 
 # --- Environment Variables ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -28,25 +42,33 @@ def get_past_topics():
 
 def generate_short_payload(retries=3):
     past_topics = get_past_topics()
+    
     with open("system_prompt.txt", "r", encoding="utf-8") as f:
         sys_prompt = f.read()
 
-    # Model cascade to prevent 404 deprecation errors
-    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
     for model_name in candidate_models:
         for attempt in range(retries):
             try:
-                print(f"Querying {model_name} (Attempt {attempt+1})...")
+                logging.info(f"Querying {model_name} (Attempt {attempt+1})...")
                 model = genai.GenerativeModel(
                     model_name=model_name,
                     system_instruction=sys_prompt,
                     generation_config={"response_mime_type": "application/json"}
                 )
                 res = model.generate_content(f"Generate a new Short. PAST_TOPICS:\n{past_topics}")
-                return json.loads(res.text)
+                
+                # Strip markdown code blocks if Gemini wraps the JSON output
+                raw_text = res.text.strip()
+                if raw_text.startswith("```json"):
+                    raw_text = raw_text[7:]
+                if raw_text.endswith("```"):
+                    raw_text = raw_text[:-3]
+                    
+                return json.loads(raw_text.strip())
             except Exception as e:
-                print(f"Error on {model_name} (Attempt {attempt+1}): {e}")
+                logging.warning(f"Error on {model_name} (Attempt {attempt+1}): {e}")
                 time.sleep(3)
 
     raise Exception("Critical: Failed to generate script across all available Gemini models.")
@@ -103,15 +125,15 @@ def get_pixabay_video(fallbacks, output_file, retries=3):
                     vid_data = requests.get(video_url, timeout=25).content
                     with open(output_file, "wb") as f:
                         f.write(vid_data)
-                    print(f"Downloaded B-roll for query: '{term}'")
+                    logging.info(f"Downloaded B-roll for query: '{term}'")
                     return True
             except Exception as e:
-                print(f"Pixabay fetch error on '{term}': {e}")
+                logging.warning(f"Pixabay fetch error on '{term}': {e}")
                 time.sleep(2)
 
     raise Exception("Critical: Failed to download video after trying all fallback queries.")
 
-# --- 5. Pure FFmpeg Video Assembly (Standardized 30FPS & YUV420P) ---
+# --- 5. Pure FFmpeg Video Assembly ---
 def render_scene(video_in, audio_in, srt_in, scene_num):
     out_scene = f"scene_{scene_num}.mp4"
     
@@ -124,7 +146,6 @@ def render_scene(video_in, audio_in, srt_in, scene_num):
     sub_style = "FontName=DejaVu Sans,FontSize=20,Bold=1,PrimaryColour=&H00FFFF,OutlineColour=&H000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=120"
     vf_string = f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,subtitles={srt_in}:force_style='{sub_style}'"
 
-    # Enforce standard 30fps, yuv420p color space, and 44.1kHz audio across all clips
     cmd = [
         "ffmpeg", "-y", "-i", video_in, "-i", audio_in,
         "-t", str(duration),
@@ -136,7 +157,8 @@ def render_scene(video_in, audio_in, srt_in, scene_num):
         "-ar", "44100",
         "-shortest", out_scene
     ]
-    subprocess.run(cmd, check=True)
+    # Supressing FFmpeg output to prevent GitHub Actions freeze
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     return out_scene
 
 def build_final_video(scene_files, output_final):
@@ -147,7 +169,7 @@ def build_final_video(scene_files, output_final):
     subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "concat.txt",
         "-c", "copy", "raw_concat.mp4"
-    ], check=True)
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
     bgm_dir = "bgm"
     has_bgm = os.path.exists(bgm_dir) and any(f.endswith(".mp3") for f in os.listdir(bgm_dir))
@@ -155,7 +177,7 @@ def build_final_video(scene_files, output_final):
     if has_bgm:
         valid_tracks = [os.path.join(bgm_dir, f) for f in os.listdir(bgm_dir) if f.endswith(".mp3")]
         random_bgm = random.choice(valid_tracks)
-        print(f"Applying BGM: {random_bgm}")
+        logging.info(f"Applying BGM: {random_bgm}")
         cmd = [
             "ffmpeg", "-y", "-i", "raw_concat.mp4", "-stream_loop", "-1", "-i", random_bgm,
             "-filter_complex", "[1:a]volume=0.10[bgm];[0:a][bgm]amix=inputs=2:duration=first[a]",
@@ -165,7 +187,7 @@ def build_final_video(scene_files, output_final):
             "-shortest", output_final
         ]
     else:
-        print("No BGM found. Normalizing final video container...")
+        logging.info("No BGM found. Normalizing final video container...")
         cmd = [
             "ffmpeg", "-y", "-i", "raw_concat.mp4",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "44100",
@@ -173,11 +195,10 @@ def build_final_video(scene_files, output_final):
             output_final
         ]
         
-    subprocess.run(cmd, check=True)
-    
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
-# --- 6. YouTube Upload ---
-def upload_to_youtube(video_path, metadata):
+# --- 6. Advanced YouTube Upload (with Headless Auth & SEO) ---
+def get_youtube_client():
     creds = Credentials(
         None,
         refresh_token=YT_REFRESH_TOKEN,
@@ -185,17 +206,24 @@ def upload_to_youtube(video_path, metadata):
         client_id=YT_CLIENT_ID,
         client_secret=YT_CLIENT_SECRET
     )
-    youtube = build("youtube", "v3", credentials=creds)
+    return build("youtube", "v3", credentials=creds)
 
-    title_str = metadata.get("title", "Consumer Psychology Trick")
-    if "#shorts" not in title_str.lower():
-        title_str = f"{title_str[:60]} #shorts"
+def upload_to_youtube(youtube, video_path, metadata):
+    base_viral_tags = ["shorts", "youtubeshorts", "viral", "foryou", "fyp"]
+    gemini_tags = metadata.get("tags", ["psychology", "facts"])
+    clean_gemini_tags = [tag.strip().replace("#", "").lower() for tag in gemini_tags]
+    
+    merged_tags = list(dict.fromkeys(base_viral_tags + clean_gemini_tags))[:15]
+    top_3_hashtags = " ".join([f"#{tag}" for tag in merged_tags[:3]])
+    
+    raw_title = metadata.get('title', 'Psychology Trick')[:60].strip()
+    title_str = f"{raw_title} {top_3_hashtags}"
 
     body = {
         "snippet": {
             "title": title_str,
-            "description": metadata.get("description", ""),
-            "tags": metadata.get("tags", ["shorts", "psychology"]),
+            "description": metadata.get("description", "Check out this short!"),
+            "tags": merged_tags,
             "categoryId": "27"
         },
         "status": {
@@ -205,11 +233,18 @@ def upload_to_youtube(video_path, metadata):
     }
 
     try:
-        media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
+        logging.info(f"Initializing upload for: {title_str}")
+        media = MediaFileUpload(video_path, chunksize=1024*1024, resumable=True, mimetype="video/mp4")
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-        response = request.execute()
+        
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                logging.info(f"Upload progress: {int(status.progress() * 100)}%")
+                
         video_id = response.get("id")
-        print(f"Upload complete! Video ID: {video_id}")
+        logging.info(f"Upload complete! Video ID: {video_id}")
 
         pinned_text = metadata.get("pinned_comment")
         if pinned_text:
@@ -222,67 +257,73 @@ def upload_to_youtube(video_path, metadata):
                 }
             }
             youtube.commentThreads().insert(part="snippet", body=comment_body).execute()
-            print("Pinned comment published.")
+            logging.info("Pinned comment published.")
+            
     except HttpError as e:
-        print(f"YouTube Data API error: {e}")
+        logging.error(f"YouTube Data API error: {e}")
         raise e
 
-# --- 7. Temporary File Cleanup ---
-def cleanup_files(scene_count):
-    files_to_delete = ["concat.txt", "raw_concat.mp4"]
-    for i in range(scene_count):
-        files_to_delete.extend([
-            f"audio_{i}.mp3", f"video_{i}.mp4", f"sub_{i}.srt",
-            f"sub_{i}.vtt", f"scene_{i}.mp4"
-        ])
+# --- 7. Smart Temporary File Cleanup ---
+def cleanup_files():
+    patterns = ["concat.txt", "raw_concat.mp4", "audio_*.mp3", "video_*.mp4", "sub_*.srt", "sub_*.vtt", "scene_*.mp4"]
+    deleted_count = 0
     
-    for f in files_to_delete:
-        if os.path.exists(f):
+    for pattern in glob.glob("*"):
+        if any(fnmatch.fnmatch(pattern, p) for p in patterns) or pattern == "final_short.mp4":
             try:
-                os.remove(f)
+                os.remove(pattern)
+                deleted_count += 1
             except OSError:
                 pass
-    print("Cleaned up temporary scene files.")
+                
+    logging.info(f"Cleaned up {deleted_count} temporary files.")
 
 # --- Execution Entry Point ---
 def main():
-    print("1. Requesting production package from Gemini...")
-    data = generate_short_payload()
-    
-    topic_id = data.get("topic_id", f"topic_{int(time.time())}")
-    with open("past_topics.txt", "a", encoding="utf-8") as f:
-        f.write(topic_id + "\n")
-
-    scenes = data.get("scenes", [])
-    voice_id = data.get("production_config", {}).get("voice_id", "en-US-ChristopherNeural")
-
-    scene_files = []
-    for i, scene in enumerate(scenes):
-        print(f"2. Processing Scene {i+1}/{len(scenes)}...")
-        a_file = f"audio_{i}.mp3"
-        vtt_file = f"sub_{i}.vtt"
-        srt_file = f"sub_{i}.srt"
-        v_file = f"video_{i}.mp4"
+    try:
+        logging.info("1. Requesting production package from Gemini...")
+        data = generate_short_payload()
         
-        spoken_text = scene.get("spoken_script", "")
-        generate_voiceover(spoken_text, voice_id, a_file, vtt_file)
-        vtt_to_srt(vtt_file, srt_file)
-        
-        fallbacks = scene.get("pexels_search_fallbacks") or scene.get("pixabay_search_fallbacks") or ["store", "money"]
-        get_pixabay_video(fallbacks, v_file)
-        
-        scene_mp4 = render_scene(v_file, a_file, srt_file, i)
-        scene_files.append(scene_mp4)
+        topic_id = data.get("topic_id", f"topic_{int(time.time())}")
+        with open("past_topics.txt", "a", encoding="utf-8") as f:
+            f.write(topic_id + "\n")
 
-    print("3. Stitching video and mixing audio tracks...")
-    build_final_video(scene_files, "final_short.mp4")
+        scenes = data.get("scenes", [])
+        voice_id = data.get("production_config", {}).get("voice_id", "en-US-ChristopherNeural")
 
-    print("4. Uploading directly to YouTube channel...")
-    upload_to_youtube("final_short.mp4", data.get("youtube_metadata", {}))
-    
-    cleanup_files(len(scenes))
-    print("Workflow execution completed successfully.")
+        scene_files = []
+        for i, scene in enumerate(scenes):
+            logging.info(f"2. Processing Scene {i+1}/{len(scenes)}...")
+            a_file = f"audio_{i}.mp3"
+            vtt_file = f"sub_{i}.vtt"
+            srt_file = f"sub_{i}.srt"
+            v_file = f"video_{i}.mp4"
+            
+            spoken_text = scene.get("spoken_script", "")
+            generate_voiceover(spoken_text, voice_id, a_file, vtt_file)
+            vtt_to_srt(vtt_file, srt_file)
+            
+            fallbacks = scene.get("pexels_search_fallbacks") or scene.get("pixabay_search_fallbacks") or ["store", "money"]
+            get_pixabay_video(fallbacks, v_file)
+            
+            scene_mp4 = render_scene(v_file, a_file, srt_file, i)
+            scene_files.append(scene_mp4)
+
+        logging.info("3. Stitching video and mixing audio tracks...")
+        build_final_video(scene_files, "final_short.mp4")
+
+        logging.info("4. Authenticating with YouTube...")
+        youtube_client = get_youtube_client()
+
+        logging.info("5. Uploading directly to YouTube channel...")
+        upload_to_youtube(youtube_client, "final_short.mp4", data.get("youtube_metadata", {}))
+        
+        logging.info("Workflow execution completed successfully.")
+        
+    except Exception as e:
+        logging.critical(f"Pipeline failed: {e}", exc_info=True)
+    finally:
+        cleanup_files()
 
 if __name__ == "__main__":
     main()
-        
