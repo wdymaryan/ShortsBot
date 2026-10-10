@@ -46,7 +46,14 @@ def generate_short_payload(retries=3):
     with open("system_prompt.txt", "r", encoding="utf-8") as f:
         sys_prompt = f.read()
 
-    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        candidate_models = [
+        "gemini-3.8-flash",       # Primary workhorse
+        "gemini-3.6-flash",       # Solid fallback
+        "gemini-3.1-pro-preview", # Advanced reasoning fallback
+        "gemini-2.5-pro",         # Legacy Pro fallback
+        "gemini-3.5-flash-lite"   # Absolute last resort safety net
+        ]
+        
 
     for model_name in candidate_models:
         for attempt in range(retries):
